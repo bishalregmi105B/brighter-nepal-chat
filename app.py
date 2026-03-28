@@ -188,6 +188,15 @@ class LiveClass(db.Model):
     watchers = db.Column(db.Integer, default=0)
 
 
+class PlatformSetting(db.Model):
+    """Mirror of the main API PlatformSetting model — read-only key-value store."""
+    __tablename__ = 'platform_settings'
+    id         = db.Column(db.Integer, primary_key=True)
+    key        = db.Column(db.String(100), unique=True, nullable=False)
+    value      = db.Column(db.Text, nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
 def _sync_live_watchers(class_id: int, count: int):
     """Update live_classes.watchers to the current socket presence count."""
     def _do():
@@ -212,6 +221,69 @@ _mem_presence: dict[str, dict[str, int]] = {}
 
 # In-memory JWT token cache to avoid DB lookup spikes: { token: (User_object, expiry_time) }
 _token_cache: dict[str, tuple] = {}
+
+# Per-room participant list: { room: { sid: {user_id, name, is_admin} } }
+_room_users: dict[str, dict[str, dict]] = {}
+
+# Per-room muted user set: { room: set(user_id) }
+_muted_users: dict[str, set] = {}
+
+# Rate limit tracking: { f"{room}:{user_id}": [timestamps...] }
+_msg_timestamps: dict[str, list] = {}
+
+# Cached rate limit settings: (max_count, window_secs, fetched_at)
+_rate_limit_cache: tuple | None = None
+_RATE_LIMIT_CACHE_TTL = 30  # seconds
+
+
+def _get_rate_limit() -> tuple[int, int]:
+    """Returns (max_messages, window_seconds) from DB/cache. Defaults: 20 msgs / 60s."""
+    global _rate_limit_cache
+    now = time.time()
+    if _rate_limit_cache and now - _rate_limit_cache[2] < _RATE_LIMIT_CACHE_TTL:
+        return _rate_limit_cache[0], _rate_limit_cache[1]
+    try:
+        rows = PlatformSetting.query.filter(
+            PlatformSetting.key.in_(['chat_rate_limit_count', 'chat_rate_limit_window_secs'])
+        ).all()
+        settings = {r.key: r.value for r in rows}
+        count  = int(settings.get('chat_rate_limit_count', '20') or '20')
+        window = int(settings.get('chat_rate_limit_window_secs', '60') or '60')
+    except Exception:
+        count, window = 20, 60
+    _rate_limit_cache = (count, window, now)
+    return count, window
+
+
+def _check_rate_limit(room: str, user_id: int) -> bool:
+    """Returns True if message is allowed, False if rate-limited."""
+    max_msgs, window = _get_rate_limit()
+    if max_msgs <= 0:  # 0 means disabled
+        return True
+    key = f'{room}:{user_id}'
+    now = time.time()
+    timestamps = _msg_timestamps.get(key, [])
+    timestamps = [t for t in timestamps if now - t < window]
+    if len(timestamps) >= max_msgs:
+        _msg_timestamps[key] = timestamps
+        return False
+    timestamps.append(now)
+    _msg_timestamps[key] = timestamps
+    return True
+
+
+def _broadcast_user_list(room: str):
+    """Broadcast deduplicated participant list to everyone in room."""
+    seen: dict[int, dict] = {}
+    for info in _room_users.get(room, {}).values():
+        uid = info['user_id']
+        if uid not in seen:
+            seen[uid] = {'user_id': uid, 'name': info['name'], 'is_admin': info['is_admin']}
+    muted = list(_muted_users.get(room, set()))
+    socketio.emit('user_list', {
+        'users': list(seen.values()),
+        'muted_user_ids': muted,
+    }, to=room)
 
 def _get_user_from_token(token: str):
     """Decode JWT and return User object or None, utilizing a 60-second LRU memory cache."""
@@ -438,6 +510,13 @@ def on_join(data):
     _presence_add(room, sid, user.id)
     _sessions[sid] = {'user': user, 'room': room}
 
+    # Track participant list
+    role = (user.role or '').strip().lower()
+    is_admin = role in ('admin', 'super-admin', 'super_admin')
+    _room_users.setdefault(room, {})[sid] = {
+        'user_id': user.id, 'name': user.name, 'is_admin': is_admin
+    }
+
     # Lock DB lookups out if Redis has verified the pool has been processed
     if REDIS_AVAILABLE and _is_room_loaded(room):
         history = _get_cached_messages(room)
@@ -452,7 +531,11 @@ def on_join(data):
     print(f'[join] sending history — {len(history)} msgs to {user.name}')
     emit('history', history)
 
-    # Broadcast updated presence count to room
+    # Send muted list to the newly joined socket
+    emit('muted_list', list(_muted_users.get(room, set())))
+
+    # Broadcast updated user list and presence to room
+    _broadcast_user_list(room)
     count = _presence_count(room)
     socketio.emit('presence', {'room': room, 'online_count': count}, to=room)
 
@@ -479,6 +562,19 @@ def on_message(data):
 
     if not text and not image_url:
         emit('error', {'msg': 'message text or image_url required'})
+        return
+
+    # Check mute
+    role = (user.role or '').strip().lower()
+    is_admin = role in ('admin', 'super-admin', 'super_admin')
+    if not is_admin and user.id in _muted_users.get(room, set()):
+        emit('error', {'msg': 'you are muted in this room', 'code': 'muted'})
+        return
+
+    # Check rate limit (admins are exempt)
+    if not is_admin and not _check_rate_limit(room, user.id):
+        max_msgs, window = _get_rate_limit()
+        emit('error', {'msg': f'Rate limit: max {max_msgs} messages per {window}s. Please wait.', 'code': 'rate_limited'})
         return
 
     # Build optimistic message dict immediately (no DB round-trip on hot path)
@@ -512,6 +608,36 @@ def on_message(data):
 
     from gevent import spawn
     spawn(_flush_to_db)
+
+
+@socketio.on('admin_mute')
+def on_admin_mute(data):
+    """Admin-only event to mute or unmute a user in a room."""
+    sid  = request.sid
+    sess = _sessions.get(sid)
+    if not sess:
+        emit('error', {'msg': 'not authenticated'})
+        return
+
+    user = sess['user']
+    role = (user.role or '').strip().lower()
+    if role not in ('admin', 'super-admin', 'super_admin'):
+        emit('error', {'msg': 'admin only'})
+        return
+
+    room           = data.get('room') or sess['room']
+    target_user_id = int(data.get('user_id', 0))
+    muted          = bool(data.get('muted', True))
+
+    muted_set = _muted_users.setdefault(room, set())
+    if muted:
+        muted_set.add(target_user_id)
+    else:
+        muted_set.discard(target_user_id)
+
+    # Broadcast updated mute state to everyone in room
+    socketio.emit('user_muted', {'user_id': target_user_id, 'muted': muted}, to=room)
+    print(f'[mute] {user.name} {"muted" if muted else "unmuted"} user_id={target_user_id} in {room}')
 
 
 @socketio.on('typing')
@@ -557,6 +683,8 @@ def on_disconnect():
 def _do_leave(sid: str, room: str, user):
     leave_room(room)
     _presence_remove(room, sid)
+    _room_users.get(room, {}).pop(sid, None)
+    _broadcast_user_list(room)
     count = _presence_count(room)
     socketio.emit('presence', {'room': room, 'online_count': count}, room=room)
     # Sync watcher count to DB for live rooms
