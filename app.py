@@ -181,6 +181,28 @@ class LiveClassMessage(db.Model):
         }
 
 
+class LiveClass(db.Model):
+    """Mirror of the main API LiveClass model — used to sync watcher counts."""
+    __tablename__ = 'live_classes'
+    id       = db.Column(db.Integer, primary_key=True)
+    watchers = db.Column(db.Integer, default=0)
+
+
+def _sync_live_watchers(class_id: int, count: int):
+    """Update live_classes.watchers to the current socket presence count."""
+    def _do():
+        with app.app_context():
+            try:
+                cls = LiveClass.query.get(class_id)
+                if cls:
+                    cls.watchers = max(0, count)
+                    db.session.commit()
+            except Exception as e:
+                print(f'[watchers] sync failed for class {class_id}: {e}')
+    from gevent import spawn
+    spawn(_do)
+
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ────────────────────────────────────────────────────────────────────────────────
@@ -432,7 +454,11 @@ def on_join(data):
 
     # Broadcast updated presence count to room
     count = _presence_count(room)
-    emit('presence', {'room': room, 'online_count': count}, to=room)
+    socketio.emit('presence', {'room': room, 'online_count': count}, to=room)
+
+    # Sync watcher count to DB for live rooms so API/frontend polls show real count
+    if room.startswith('live:'):
+        _sync_live_watchers(int(room.split(':')[1]), count)
 
     print(f'[join] ✓ {user.name} joined {room}  (online: {count})')
 
@@ -471,7 +497,7 @@ def on_message(data):
     _cache_message(room, optimistic_msg)
 
     # 2. Broadcast to all users in room instantly — no DB wait
-    emit('message', optimistic_msg, to=room)
+    socketio.emit('message', optimistic_msg, to=room)
 
     # 3. Write to DB asynchronously in a background gevent greenlet
     #    This does NOT block the socket event loop
@@ -533,6 +559,9 @@ def _do_leave(sid: str, room: str, user):
     _presence_remove(room, sid)
     count = _presence_count(room)
     socketio.emit('presence', {'room': room, 'online_count': count}, room=room)
+    # Sync watcher count to DB for live rooms
+    if room.startswith('live:'):
+        _sync_live_watchers(int(room.split(':')[1]), count)
     print(f'[leave] {user.name} ← {room}  (online: {count})')
 
 
