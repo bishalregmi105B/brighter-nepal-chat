@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: brighter-nepal-chat
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -c gunicorn.conf.py app:app
+    plan: starter          # upgrade to 'standard' for more workers
+    envVars:
+      - key: SECRET_KEY
+        sync: false        # set manually in Render dashboard
+      - key: JWT_SECRET_KEY
+        sync: false        # must match brighter-nepal-api's JWT_SECRET_KEY
+      - key: DATABASE_URI
+        sync: false        # postgresql://user:pass@host/db
+      - key: REDIS_URL
+        fromService:
+          name: brighter-nepal-chat-redis
+          type: redis
+          property: connectionString
+      - key: FRONTEND_URL
+        sync: false        # e.g. https://your-frontend.vercel.app
+      - key: PYTHON_VERSION
+        value: 3.11.0
+
+  - type: redis
+    name: brighter-nepal-chat-redis
+    plan: starter          # free-tier Redis (25 MB)
+    ipAllowList: []        # allow all internal connections

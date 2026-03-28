@@ -1,0 +1,11 @@
+flask==3.0.3
+flask-socketio==5.3.7
+flask-cors==4.0.1
+flask-sqlalchemy==3.1.1
+flask-jwt-extended==4.6.0
+werkzeug==3.0.3
+python-dotenv==1.0.1
+redis==5.0.4
+gevent>=25.0.0
+gevent-websocket>=0.10.1
+gunicorn==21.2.0
