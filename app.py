@@ -66,7 +66,7 @@ REDIS_URL    = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
 MESSAGE_CACHE_SIZE = 50   # number of messages to cache per room in Redis
 
-CORS(app, origins=[FRONTEND_URL, 'http://localhost:3000', 'http://localhost:3001'])
+CORS(app, origins=[FRONTEND_URL])
 
 db  = SQLAlchemy(app)
 jwt = JWTManager(app)
@@ -87,7 +87,7 @@ except Exception as e:
 if REDIS_AVAILABLE:
     socketio = SocketIO(
         app,
-        cors_allowed_origins=[FRONTEND_URL, 'http://localhost:3000', 'http://localhost:3001'],
+        cors_allowed_origins=[FRONTEND_URL],
         message_queue=REDIS_URL,
         async_mode='gevent',
         ping_timeout=60,
@@ -96,7 +96,7 @@ if REDIS_AVAILABLE:
 else:
     socketio = SocketIO(
         app,
-        cors_allowed_origins=[FRONTEND_URL, 'http://localhost:3000', 'http://localhost:3001'],
+        cors_allowed_origins=[FRONTEND_URL],
         async_mode='gevent',
         ping_timeout=60,
         ping_interval=25,

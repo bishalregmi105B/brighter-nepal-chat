@@ -1,31 +1,29 @@
 """
 Gunicorn production config for brighter-nepal-chat (gevent WebSocket server).
+Optimised for 4 vCPU / 8 GB RAM VPS.
 Run: gunicorn -c gunicorn.conf.py app:app
 """
-import multiprocessing
+import os as _os
 
-# gevent workers are required for WebSocket + long-lived connections
+# gevent workers handle WebSocket + long-lived connections via greenlets
 worker_class = 'geventwebsocket.gunicorn.workers.GeventWebSocketWorker'
 
-# For async WebSocket servers, 1–2 workers per core is fine
-# gevent handles thousands of connections within each worker via coroutines
-workers = max(2, multiprocessing.cpu_count())
+# 2 workers is enough — gevent handles thousands of connections per worker.
+# More workers just waste RAM on this small VPS.
+workers = int(_os.environ.get('CHAT_CONCURRENCY', '2'))
 
-# Each worker can handle thousands of greenlet connections
-worker_connections = 5000
+# Each worker can hold up to 3000 persistent WebSocket connections
+worker_connections = 3000
 
-# Longer timeout for WebSocket servers — connections are persistent
+# Longer timeout for WebSocket — connections are persistent
 timeout = 300
 graceful_timeout = 30
 keepalive = 75
 
 backlog = 2048
 
-# Binding — Render (and most PaaS) inject $PORT dynamically
-import os as _os
 bind = f"0.0.0.0:{_os.environ.get('PORT', '5001')}"
 
-# Logging
 accesslog = '-'
 errorlog  = '-'
 loglevel  = 'warning'
