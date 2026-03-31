@@ -151,6 +151,7 @@ class GroupMessage(db.Model):
             'group_id':    self.group_id,
             'user_id':     self.user_id,
             'sender_name': self.user.name if self.user else 'Unknown',
+            'sender_role': self.user.role if self.user else 'student',
             'text':        self.text,
             'image_url':   self.image_url,
             'created_at':  self.created_at.isoformat(),
@@ -175,6 +176,7 @@ class LiveClassMessage(db.Model):
             'class_id':    self.class_id,
             'user_id':     self.user_id,
             'sender_name': self.user.name if self.user else 'Unknown',
+            'sender_role': self.user.role if self.user else 'student',
             'text':        self.text,
             'image_url':   self.image_url,
             'created_at':  self.created_at.isoformat(),
@@ -234,6 +236,26 @@ _msg_timestamps: dict[str, list] = {}
 # Cached rate limit settings: (max_count, window_secs, fetched_at)
 _rate_limit_cache: tuple | None = None
 _RATE_LIMIT_CACHE_TTL = 30  # seconds
+
+# ── Blocked word patterns (case-insensitive) ──────────────────────────────────
+import re as _re
+_BLOCKED_WORDS = [
+    r'\bbridge\s*course\b',
+    r'\bbridge\b',
+    r'\bentrance\s*preparation\b',
+    r'\bentrance\s*prep\b',
+    r'\bIOE\b',
+    r'\bIOM\b',
+    r'\bCSIT\b',
+]
+_BLOCKED_RE = _re.compile('|'.join(_BLOCKED_WORDS), _re.IGNORECASE)
+
+
+def _contains_blocked_words(text: str) -> bool:
+    """Return True if text matches any blocked word pattern."""
+    if not text:
+        return False
+    return bool(_BLOCKED_RE.search(text))
 
 
 def _get_rate_limit() -> tuple[int, int]:
@@ -529,6 +551,15 @@ def on_join(data):
             _mark_room_loaded(room) # Deflect future SQLite loading for empty rooms
             
     print(f'[join] sending history — {len(history)} msgs to {user.name}')
+
+    # Filter history: students only see their own messages + admin messages
+    if not is_admin:
+        history = [
+            m for m in history
+            if m.get('user_id') == user.id
+            or (m.get('sender_role') or 'student').strip().lower() in ('admin', 'super-admin', 'super_admin')
+        ]
+
     emit('history', history)
 
     # Send muted list to the newly joined socket
@@ -577,6 +608,11 @@ def on_message(data):
         emit('error', {'msg': f'Rate limit: max {max_msgs} messages per {window}s. Please wait.', 'code': 'rate_limited'})
         return
 
+    # Check blocked words (admins are exempt)
+    if not is_admin and _contains_blocked_words(text):
+        emit('error', {'msg': 'Your message contains restricted words. Please rephrase.', 'code': 'blocked_word'})
+        return
+
     # Build optimistic message dict immediately (no DB round-trip on hot path)
     now_iso = datetime.utcnow().isoformat()
     optimistic_msg = {
@@ -584,6 +620,7 @@ def on_message(data):
         'group_id' if room.startswith('group') else 'class_id': int(room.split(':')[1]),
         'user_id':     user.id,
         'sender_name': user.name,
+        'sender_role': user.role or 'student',
         'text':        text or '',
         'image_url':   image_url,
         'created_at':  now_iso,
@@ -592,8 +629,17 @@ def on_message(data):
     # 1. Cache in Redis immediately (fast path)
     _cache_message(room, optimistic_msg)
 
-    # 2. Broadcast to all users in room instantly — no DB wait
-    socketio.emit('message', optimistic_msg, to=room)
+    # 2. Route messages: admin messages → everyone, student messages → sender + admins only
+    if is_admin:
+        # Admin messages are visible to all participants
+        socketio.emit('message', optimistic_msg, to=room)
+    else:
+        # Student messages: send back to the sender
+        emit('message', optimistic_msg)
+        # Also deliver to all admin sockets in the room
+        for other_sid, info in _room_users.get(room, {}).items():
+            if info.get('is_admin') and other_sid != sid:
+                socketio.emit('message', optimistic_msg, to=other_sid)
 
     # 3. Write to DB asynchronously in a background gevent greenlet
     #    This does NOT block the socket event loop
